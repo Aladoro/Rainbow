@@ -144,9 +144,43 @@ class ReplayMemory():
     nonterminals = torch.tensor(np.expand_dims(transitions['nonterminal'][:, self.history + self.n - 1], axis=1), dtype=torch.float32, device=self.device)
     return probs, idxs, tree_idxs, states, actions, R, next_states, nonterminals
 
+  # Returns a valid sample from each segment
+  def _get_samples_from_segments_det(self, batch_size, p_total):
+    segment_length = p_total / batch_size  # Batch size number of segments, based on sum over all probabilities
+    segment_starts = np.arange(batch_size) * segment_length
+    valid = False
+    while not valid:
+      samples = segment_length*0.5 + segment_starts  # Get midpoints from all segments
+      probs, idxs, tree_idxs = self.transitions.find(samples)  # Retrieve samples from tree with un-normalised probability
+      if np.all((self.transitions.index - idxs) % self.capacity > self.n) and np.all((idxs - self.transitions.index) % self.capacity >= self.history) and np.all(probs != 0):
+        valid = True  # Note that conditions are valid but extra conservative around buffer index 0
+    # Retrieve all required transition data (from t - h to t + n)
+    transitions = self._get_transitions(idxs)
+    # Create un-discretised states and nth next states
+    all_states = transitions['state']
+    states = torch.tensor(all_states[:, :self.history], device=self.device, dtype=torch.float32).div_(255)
+    next_states = torch.tensor(all_states[:, self.n:self.n + self.history], device=self.device, dtype=torch.float32).div_(255)
+    # Discrete actions to be used as index
+    actions = torch.tensor(np.copy(transitions['action'][:, self.history - 1]), dtype=torch.int64, device=self.device)
+    # Calculate truncated n-step discounted returns R^n = Σ_k=0->n-1 (γ^k)R_t+k+1 (note that invalid nth next states have reward 0)
+    rewards = torch.tensor(np.copy(transitions['reward'][:, self.history - 1:-1]), dtype=torch.float32, device=self.device)
+    R = torch.matmul(rewards, self.reward_scaling)
+    # Mask for non-terminal nth next states
+    nonterminals = torch.tensor(np.expand_dims(transitions['nonterminal'][:, self.history + self.n - 1], axis=1), dtype=torch.float32, device=self.device)
+    return probs, idxs, tree_idxs, states, actions, R, next_states, nonterminals
+
   def sample(self, batch_size):
     p_total = self.transitions.total()  # Retrieve sum of all priorities (used to create a normalised probability distribution)
     probs, idxs, tree_idxs, states, actions, returns, next_states, nonterminals = self._get_samples_from_segments(batch_size, p_total)  # Get batch of valid samples
+    probs = probs / p_total  # Calculate normalised probabilities
+    capacity = self.capacity if self.transitions.full else self.transitions.index
+    weights = (capacity * probs) ** -self.priority_weight  # Compute importance-sampling weights w
+    weights = torch.tensor(weights / weights.max(), dtype=torch.float32, device=self.device)  # Normalise by max importance-sampling weight from batch
+    return tree_idxs, states, actions, returns, next_states, nonterminals, weights
+
+  def sample_det(self, batch_size):
+    p_total = self.transitions.total()  # Retrieve sum of all priorities (used to create a normalised probability distribution)
+    probs, idxs, tree_idxs, states, actions, returns, next_states, nonterminals = self._get_samples_from_segments_det(batch_size, p_total)  # Get batch of valid samples
     probs = probs / p_total  # Calculate normalised probabilities
     capacity = self.capacity if self.transitions.full else self.transitions.index
     weights = (capacity * probs) ** -self.priority_weight  # Compute importance-sampling weights w
